@@ -5,7 +5,7 @@
 ## 功能特性
 
 - 将 Gotify 消息转发到微信
--安全的 Token 缓存
+- 安全的 Token 缓存
 - 支持模板消息
 - 通过 Gotify WebUI 轻松配置
 - 提供 Webhook 接口支持外部集成

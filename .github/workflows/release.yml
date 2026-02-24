@@ -1,0 +1,62 @@
+name: Release Build
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Build Linux AMD64
+        run: |
+          mkdir -p build
+          docker run --rm \
+            -v "${{ github.workspace }}:/proj" \
+            -w /proj \
+            gotify/build:1.21-linux-amd64 \
+            go build -a -installsuffix cgo -ldflags "-w -s" \
+            -buildmode=plugin \
+            -o build/gotify-wechat-plugin-linux-amd64.so \
+            .
+
+      - name: Build Linux ARM64
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/proj" \
+            -w /proj \
+            gotify/build:1.21-linux-arm64 \
+            go build -a -installsuffix cgo -ldflags "-w -s" \
+            -buildmode=plugin \
+            -o build/gotify-wechat-plugin-linux-arm64.so \
+            .
+
+      - name: Build Linux ARMv7
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/proj" \
+            -w /proj \
+            gotify/build:1.21-linux-arm-7 \
+            go build -a -installsuffix cgo -ldflags "-w -s" \
+            -buildmode=plugin \
+            -o build/gotify-wechat-plugin-linux-arm-7.so \
+            .
+
+      - name: Upload Release Assets
+        uses: softprops/action-gh-release@v1
+        with:
+          files: build/*.so
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
