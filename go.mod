@@ -1,4 +1,4 @@
-module github.com/yourusername/gotify-wechat-plugin
+module github.com/Wuqiyang312/gotify-wechat-plugin
 
 go 1.21
 
