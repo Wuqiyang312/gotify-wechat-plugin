@@ -32,14 +32,14 @@ jobs:
 
       - name: Build Linux ARM64
         run: |
-          GOOS=linux GOARCH=arm64 go build -a -installsuffix cgo -ldflags "-w -s" \
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -a -installsuffix cgo -ldflags "-w -s" \
             -buildmode=plugin \
             -o build/gotify-wechat-plugin-linux-arm64.so \
             .
 
       - name: Build Linux ARMv7
         run: |
-          GOOS=linux GOARCH=arm GOARM=7 go build -a -installsuffix cgo -ldflags "-w -s" \
+          GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 go build -a -installsuffix cgo -ldflags "-w -s" \
             -buildmode=plugin \
             -o build/gotify-wechat-plugin-linux-arm-7.so \
             .
