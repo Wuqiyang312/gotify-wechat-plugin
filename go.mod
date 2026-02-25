@@ -1,6 +1,8 @@
 module github.com/Wuqiyang312/gotify-wechat-plugin
 
-go 1.21
+go 1.24.0
+
+toolchain go1.25.1
 
 require (
 	github.com/gin-gonic/gin v1.9.1

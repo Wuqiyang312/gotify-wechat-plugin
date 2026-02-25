@@ -12,10 +12,17 @@ jobs:
       go-version: ${{ steps.get-version.outputs.version }}
     steps:
       - name: Fetch gotify/server GO_VERSION
-        run: |
-          curl -sL https://raw.githubusercontent.com/gotify/server/master/GO_VERSION > GO_VERSION
-          echo "version=$(cat GO_VERSION | tr -d '\n')" >> $GITHUB_OUTPUT
         id: get-version
+        run: |
+          # 获取与 gotify/server 最新 release 一致的 Go 版本
+          SERVER_VERSION=$(curl -sL https://api.github.com/repos/gotify/server/releases/latest | jq -r '.tag_name')
+          GO_VERSION=$(curl -sL "https://raw.githubusercontent.com/gotify/server/${SERVER_VERSION}/GO_VERSION" | tr -d '\n\r ')
+          if [ -z "$GO_VERSION" ]; then
+            echo "::error::Failed to fetch GO_VERSION"
+            exit 1
+          fi
+          echo "version=$GO_VERSION" >> $GITHUB_OUTPUT
+          echo "Gotify Server: $SERVER_VERSION, Go: $GO_VERSION"
 
   build:
     needs: detect-go-version
@@ -26,39 +33,26 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            platform: linux/amd64
-            goarch: amd64
+            build-image-suffix: linux-amd64
           - arch: arm64
-            platform: linux/arm64
-            goarch: arm64
-          - arch: armv7
-            platform: linux/arm/v7
-            goarch: arm
+            build-image-suffix: linux-arm64
+          - arch: arm-7
+            build-image-suffix: linux-arm-7
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      # 🔑 使用动态获取的 Go 版本，自动跟进小版本更新
-      - name: Build plugin in Docker
+      # 使用 gotify/build 镜像确保与 gotify/server 编译环境完全一致
+      - name: Build plugin with gotify/build
         run: |
           mkdir -p build
-          docker run --rm --platform ${{ matrix.platform }} \
-            -v $PWD:/workspace \
-            -w /workspace \
-            golang:${{ needs.detect-go-version.outputs.go-version }} \
-            sh -c "
-              export GOOS=linux GOARCH=${{ matrix.goarch }} &&
-              go mod tidy &&
-              go build -a -trimpath -buildvcs=false -buildmode=plugin \
-                -ldflags='-w -s' \
-                -o build/gotify-wechat-plugin-linux-${{ matrix.arch }}.so .
-            "
+          docker run --rm \
+            -v "$PWD:/proj" \
+            -w /proj \
+            gotify/build:${{ needs.detect-go-version.outputs.go-version }}-${{ matrix.build-image-suffix }} \
+            go build -a -installsuffix cgo -ldflags "-w -s" \
+              -buildmode=plugin \
+              -o build/gotify-wechat-plugin-linux-${{ matrix.arch }}.so .
 
       - name: Verify plugin
         run: file build/*.so

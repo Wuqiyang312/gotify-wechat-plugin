@@ -7,7 +7,7 @@ import (
 func GetGotifyPluginInfo() plugin.Info {
 	return plugin.Info{
 		ModulePath:  "github.com/Wuqiyang312/gotify-wechat-plugin",
-		Version:     "0.0.9",
+		Version:     "0.0.10",
 		Author:      "Wuqiyang312",
 		Website:     "https://github.com/Wuqiyang312/gotify-wechat-plugin",
 		Description: "将 Gotify 消息转发到微信",
