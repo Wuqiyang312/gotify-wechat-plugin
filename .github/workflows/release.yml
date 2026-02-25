@@ -54,8 +54,7 @@ jobs:
             -v "/tmp/gotify-server-go.mod:/tmp/gotify-server-go.mod" \
             -w /proj \
             gotify/build:${{ needs.detect-go-version.outputs.go-version }}-${{ matrix.build-image-suffix }} \
-            sh -c "go install github.com/gotify/plugin-api/cmd/gomod-cap@latest && \
-                   gomod-cap -from /tmp/gotify-server-go.mod -to go.mod && \
+            sh -c "go run github.com/gotify/plugin-api/cmd/gomod-cap@latest -from /tmp/gotify-server-go.mod -to go.mod && \
                    go mod tidy && \
                    go build -a -installsuffix cgo -ldflags '-w -s' \
                      -buildmode=plugin \
