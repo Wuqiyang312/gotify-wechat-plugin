@@ -1,3 +1,8 @@
+<p align="center">
+    <img height="124px" src="https://github.com/Wuqiyang312/gotify-wechat-plugin/blob/main/img/logo.png" />
+</p>
+
+
 # Gotify 微信推送插件
 
 一个将 Gotify 消息转发到微信的插件。

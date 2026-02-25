@@ -6,7 +6,19 @@ on:
       - 'v*.*.*'
 
 jobs:
+  detect-go-version:
+    runs-on: ubuntu-latest
+    outputs:
+      go-version: ${{ steps.get-version.outputs.version }}
+    steps:
+      - name: Fetch gotify/server GO_VERSION
+        run: |
+          curl -sL https://raw.githubusercontent.com/gotify/server/master/GO_VERSION > GO_VERSION
+          echo "version=$(cat GO_VERSION | tr -d '\n')" >> $GITHUB_OUTPUT
+        id: get-version
+
   build:
+    needs: detect-go-version
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -15,10 +27,13 @@ jobs:
         include:
           - arch: amd64
             platform: linux/amd64
+            goarch: amd64
           - arch: arm64
             platform: linux/arm64
-          - arch: arm-v7
+            goarch: arm64
+          - arch: armv7
             platform: linux/arm/v7
+            goarch: arm
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -29,14 +44,24 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # 🔑 使用动态获取的 Go 版本，自动跟进小版本更新
       - name: Build plugin in Docker
         run: |
           mkdir -p build
           docker run --rm --platform ${{ matrix.platform }} \
             -v $PWD:/workspace \
             -w /workspace \
-            golang:1.21 \
-            sh -c "go mod tidy && go build -buildvcs=false -buildmode=plugin -ldflags '-w -s' -o build/gotify-wechat-plugin-linux-${{ matrix.arch }}.so ."
+            golang:${{ needs.detect-go-version.outputs.go-version }} \
+            sh -c "
+              export GOOS=linux GOARCH=${{ matrix.goarch }} &&
+              go mod tidy &&
+              go build -a -trimpath -buildvcs=false -buildmode=plugin \
+                -ldflags='-w -s' \
+                -o build/gotify-wechat-plugin-linux-${{ matrix.arch }}.so .
+            "
+
+      - name: Verify plugin
+        run: file build/*.so
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -58,7 +83,7 @@ jobs:
           merge-multiple: true
 
       - name: Upload Release Assets
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           files: build/*.so
           generate_release_notes: true

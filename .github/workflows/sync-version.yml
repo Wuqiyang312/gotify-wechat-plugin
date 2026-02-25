@@ -1,0 +1,187 @@
+name: Sync Gotify Server Version
+
+on:
+  schedule:
+    # 每天 UTC 0 点检查（北京时间 8 点）
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+    inputs:
+      force_check:
+        description: '强制检查并创建 tag'
+        required: false
+        default: 'false'
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      server-version: ${{ steps.get-server-info.outputs.server-version }}
+      server-go-version: ${{ steps.get-server-info.outputs.go-version }}
+      current-go-version: ${{ steps.get-current-info.outputs.go-version }}
+      needs-update: ${{ steps.compare.outputs.needs-update }}
+      new-tag: ${{ steps.generate-tag.outputs.new-tag }}
+    steps:
+      - name: Checkout plugin code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Get latest gotify/server info
+        id: get-server-info
+        run: |
+          # 获取最新 release tag
+          SERVER_VERSION=$(curl -sL https://api.github.com/repos/gotify/server/releases/latest | jq -r '.tag_name')
+          if [ -z "$SERVER_VERSION" ] || [ "$SERVER_VERSION" = "null" ]; then
+            echo "::error::Failed to fetch gotify/server latest release"
+            exit 1
+          fi
+          # 获取对应版本的 GO_VERSION
+          GO_VERSION=$(curl -sL "https://raw.githubusercontent.com/gotify/server/${SERVER_VERSION}/GO_VERSION" 2>/dev/null)
+          if [ -z "$GO_VERSION" ]; then
+            GO_VERSION=$(curl -sL https://raw.githubusercontent.com/gotify/server/master/GO_VERSION)
+          fi
+          GO_VERSION=$(echo "$GO_VERSION" | tr -d '\n\r ')
+          if [ -z "$GO_VERSION" ]; then
+            echo "::error::Failed to fetch Go version from gotify/server"
+            exit 1
+          fi
+          echo "server-version=$SERVER_VERSION" >> $GITHUB_OUTPUT
+          echo "go-version=$GO_VERSION" >> $GITHUB_OUTPUT
+          echo "Gotify Server: $SERVER_VERSION"
+          echo "Go Version: $GO_VERSION"
+
+      - name: Get current plugin Go version
+        id: get-current-info
+        run: |
+          # 从 GO_VERSION 文件读取（此文件由本 workflow 维护）
+          if [ -f "GO_VERSION" ]; then
+            CURRENT_GO=$(cat GO_VERSION | tr -d '\n\r ')
+          else
+            CURRENT_GO="unknown"
+          fi
+          echo "go-version=$CURRENT_GO" >> $GITHUB_OUTPUT
+          echo "Current Go Version: $CURRENT_GO"
+
+      - name: Compare versions
+        id: compare
+        run: |
+          SERVER_GO="${{ steps.get-server-info.outputs.go-version }}"
+          CURRENT_GO="${{ steps.get-current-info.outputs.go-version }}"
+          FORCE="${{ github.event.inputs.force_check }}"
+
+          if [ "$FORCE" = "true" ]; then
+            echo "needs-update=true" >> $GITHUB_OUTPUT
+            echo "Force check enabled, will create tag"
+          elif [ "$CURRENT_GO" = "unknown" ]; then
+            echo "needs-update=true" >> $GITHUB_OUTPUT
+            echo "No GO_VERSION file found, will initialize"
+          elif [ "$SERVER_GO" != "$CURRENT_GO" ]; then
+            echo "needs-update=true" >> $GITHUB_OUTPUT
+            echo "Go version changed: $CURRENT_GO -> $SERVER_GO"
+          else
+            echo "needs-update=false" >> $GITHUB_OUTPUT
+            echo "Go version matches: $CURRENT_GO"
+          fi
+
+      - name: Generate new tag
+        id: generate-tag
+        if: steps.compare.outputs.needs-update == 'true'
+        run: |
+          # 获取所有 tag 并找到最新的版本号
+          LATEST_TAG=$(git tag --sort=-v:refname | head -1)
+          if [ -z "$LATEST_TAG" ]; then
+            LATEST_TAG="v0.0.0-beta"
+          fi
+          echo "Latest tag: $LATEST_TAG"
+
+          # 解析版本号：支持 v0.0.8-beta 和 v0.0.8-beta-go1.22 两种格式
+          # 先去掉 -go 后缀（如果有）
+          BASE_TAG=$(echo "$LATEST_TAG" | sed -E 's/-go[0-9.]+$//')
+
+          # 提取 major.minor.patch
+          if [[ "$BASE_TAG" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+            MAJOR="${BASH_REMATCH[1]}"
+            MINOR="${BASH_REMATCH[2]}"
+            PATCH="${BASH_REMATCH[3]}"
+          else
+            echo "::error::Cannot parse version from tag: $LATEST_TAG"
+            exit 1
+          fi
+
+          # 提取后缀（如 -beta）
+          SUFFIX=$(echo "$BASE_TAG" | sed -E 's/^v[0-9]+\.[0-9]+\.[0-9]+//')
+
+          # 递增 patch 版本号
+          NEW_PATCH=$((PATCH + 1))
+          NEW_TAG="v${MAJOR}.${MINOR}.${NEW_PATCH}${SUFFIX}"
+
+          # 检查 tag 是否已存在，如果存在则继续递增
+          while git rev-parse "$NEW_TAG" >/dev/null 2>&1; do
+            NEW_PATCH=$((NEW_PATCH + 1))
+            NEW_TAG="v${MAJOR}.${MINOR}.${NEW_PATCH}${SUFFIX}"
+          done
+
+          echo "new-tag=$NEW_TAG" >> $GITHUB_OUTPUT
+          echo "New tag: $NEW_TAG"
+
+  create-tag:
+    needs: check-version
+    if: needs.check-version.outputs.needs-update == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Update GO_VERSION file
+        run: |
+          echo "${{ needs.check-version.outputs.server-go-version }}" > GO_VERSION
+          git add GO_VERSION
+
+      - name: Commit, tag and push
+        run: |
+          NEW_TAG="${{ needs.check-version.outputs.new-tag }}"
+          SERVER_GO="${{ needs.check-version.outputs.server-go-version }}"
+          SERVER_VER="${{ needs.check-version.outputs.server-version }}"
+
+          # 检查是否有变更需要提交
+          if git diff --cached --quiet; then
+            echo "No changes to commit, creating tag on current HEAD"
+          else
+            git commit -m "chore: sync go version to ${SERVER_GO}"
+          fi
+
+          git tag -a "$NEW_TAG" -m "Auto-sync with gotify/server ${SERVER_VER} (Go ${SERVER_GO})"
+
+          # 同时推送 commit 和 tag
+          git push origin HEAD:main
+          git push origin "$NEW_TAG"
+          echo "Created and pushed tag: $NEW_TAG"
+
+      - name: Create release draft
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check-version.outputs.new-tag }}
+          name: "${{ needs.check-version.outputs.new-tag }}"
+          body: |
+            ## 自动版本同步
+
+            - **Gotify Server**: ${{ needs.check-version.outputs.server-version }}
+            - **Go Version**: ${{ needs.check-version.outputs.server-go-version }}
+            - **Previous Go Version**: ${{ needs.check-version.outputs.current-go-version }}
+            - **同步时间**: ${{ github.run_id }}
+
+            > 此 release 为自动创建，请确认构建成功后再发布
+          draft: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
