@@ -47,6 +47,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: ${{ needs.detect-go-version.outputs.go-version }}
+          cache: false
 
       - name: Align dependencies with gotify/server
         run: |
@@ -55,6 +56,8 @@ jobs:
           curl -sL "https://raw.githubusercontent.com/gotify/server/${SERVER_VERSION}/go.mod" -o /tmp/gotify-server-go.mod
           go run github.com/gotify/plugin-api/cmd/gomod-cap@latest -from /tmp/gotify-server-go.mod -to go.mod
           go mod tidy
+          echo "=== Verify golang.org/x/sys version ==="
+          grep 'golang.org/x/sys' go.mod || echo "WARNING: golang.org/x/sys not found in go.mod"
 
       # 使用 gotify/build 交叉编译镜像构建插件
       - name: Build plugin
