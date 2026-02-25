@@ -42,17 +42,24 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # 使用 gotify/build 镜像确保与 gotify/server 编译环境完全一致
-      - name: Build plugin with gotify/build
+      # 使用 gomod-cap 对齐插件依赖版本与 gotify/server 完全一致，然后构建
+      - name: Align dependencies and build plugin
         run: |
+          SERVER_VERSION=$(curl -sL https://api.github.com/repos/gotify/server/releases/latest | jq -r '.tag_name')
+          echo "Aligning dependencies with gotify/server ${SERVER_VERSION}"
+          curl -sL "https://raw.githubusercontent.com/gotify/server/${SERVER_VERSION}/go.mod" -o /tmp/gotify-server-go.mod
           mkdir -p build
           docker run --rm \
             -v "$PWD:/proj" \
+            -v "/tmp/gotify-server-go.mod:/tmp/gotify-server-go.mod" \
             -w /proj \
             gotify/build:${{ needs.detect-go-version.outputs.go-version }}-${{ matrix.build-image-suffix }} \
-            sh -c "go mod tidy && go build -a -installsuffix cgo -ldflags '-w -s' \
-              -buildmode=plugin \
-              -o build/gotify-wechat-plugin-linux-${{ matrix.arch }}.so ."
+            sh -c "go install github.com/gotify/plugin-api/cmd/gomod-cap@latest && \
+                   gomod-cap -from /tmp/gotify-server-go.mod -to go.mod && \
+                   go mod tidy && \
+                   go build -a -installsuffix cgo -ldflags '-w -s' \
+                     -buildmode=plugin \
+                     -o build/gotify-wechat-plugin-linux-${{ matrix.arch }}.so ."
 
       - name: Verify plugin
         run: file build/*.so
