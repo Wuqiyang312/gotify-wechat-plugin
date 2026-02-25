@@ -11,19 +11,6 @@ type Recipient struct {
 	OpenID string `yaml:"openid" json:"openid"`
 }
 
-// RouteMatch 路由匹配条件
-type RouteMatch struct {
-	AppID       []int `yaml:"app_id" json:"app_id"`
-	MinPriority *int  `yaml:"min_priority" json:"min_priority"`
-}
-
-// Route 消息路由规则
-type Route struct {
-	Name       string     `yaml:"name" json:"name"`
-	Match      RouteMatch `yaml:"match" json:"match"`
-	Recipients []string   `yaml:"recipients" json:"recipients"`
-}
-
 // Config 插件配置
 type Config struct {
 	AppID      string `yaml:"appid" json:"appid"`
@@ -34,9 +21,8 @@ type Config struct {
 	// 向后兼容：单 OpenID 模式
 	OpenID string `yaml:"openid" json:"openid"`
 
-	// 多接收者 + 路由模式
+	// 多接收者模式
 	Recipients []Recipient `yaml:"recipients" json:"recipients"`
-	Routes     []Route     `yaml:"routes" json:"routes"`
 }
 
 func (p *WeChatPlugin) DefaultConfig() interface{} {
@@ -47,7 +33,6 @@ func (p *WeChatPlugin) DefaultConfig() interface{} {
 		TemplateID: "",
 		JumpURL:    "https://push.hzz.cool",
 		Recipients: []Recipient{},
-		Routes:     []Route{},
 	}
 }
 
@@ -89,21 +74,6 @@ func (p *WeChatPlugin) ValidateAndSetConfig(c interface{}) error {
 			return fmt.Errorf("recipient[%d]: duplicate name %q", i, r.Name)
 		}
 		recipientNames[r.Name] = true
-	}
-
-	// 验证 Routes
-	for i, route := range config.Routes {
-		if strings.TrimSpace(route.Name) == "" {
-			return fmt.Errorf("route[%d]: name is required", i)
-		}
-		if len(route.Recipients) == 0 {
-			return fmt.Errorf("route[%d] %q: at least one recipient is required", i, route.Name)
-		}
-		for _, rName := range route.Recipients {
-			if !recipientNames[rName] {
-				return fmt.Errorf("route[%d] %q: unknown recipient %q", i, route.Name, rName)
-			}
-		}
 	}
 
 	if strings.TrimSpace(config.JumpURL) == "" {

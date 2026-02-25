@@ -53,15 +53,6 @@ type WechatAPIResponse struct {
 	Msgid   int64  `json:"msgid"`
 }
 
-// GotifyMessage gotify 标准消息格式
-type GotifyMessage struct {
-	AppID    int                    `json:"appid"`
-	Title    string                 `json:"title"`
-	Message  string                 `json:"message" binding:"required"`
-	Priority int                    `json:"priority"`
-	Extras   map[string]interface{} `json:"extras"`
-}
-
 func (p *WeChatPlugin) Enable() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -96,59 +87,6 @@ func (p *WeChatPlugin) SetStorageHandler(h plugin.StorageHandler) {
 
 func (p *WeChatPlugin) RegisterWebhook(basePath string, router *gin.RouterGroup) {
 	p.basePath = basePath
-
-	// POST /message - gotify 标准消息格式，支持路由
-	router.POST("/message", func(c *gin.Context) {
-		if !p.enabled {
-			c.JSON(http.StatusServiceUnavailable, gin.H{
-				"error": "plugin is disabled",
-			})
-			return
-		}
-
-		var msg GotifyMessage
-		if err := c.ShouldBindJSON(&msg); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{
-				"error": fmt.Sprintf("invalid request: %v", err),
-			})
-			return
-		}
-
-		title := msg.Title
-		if title == "" {
-			title = "Gotify Notification"
-		}
-
-		// 解析路由，找到目标 OpenID 列表
-		openIDs := p.resolveRecipients(msg.AppID, msg.Priority)
-		if len(openIDs) == 0 {
-			c.JSON(http.StatusOK, gin.H{
-				"success": true,
-				"message": "no matching recipients, message skipped",
-			})
-			return
-		}
-
-		// 发送给所有匹配的接收者
-		errors := p.sendToMultiple(openIDs, title, msg.Message)
-		if len(errors) > 0 {
-			errMsgs := make([]string, len(errors))
-			for i, e := range errors {
-				errMsgs[i] = e.Error()
-			}
-			c.JSON(http.StatusInternalServerError, gin.H{
-				"error":   fmt.Sprintf("partial failure: %d/%d failed", len(errors), len(openIDs)),
-				"details": errMsgs,
-			})
-			return
-		}
-
-		c.JSON(http.StatusOK, gin.H{
-			"success":    true,
-			"message":    "sent to WeChat successfully",
-			"recipients": len(openIDs),
-		})
-	})
 
 	// POST /send - 向后兼容旧接口，发送给所有接收者
 	router.POST("/send", func(c *gin.Context) {
@@ -220,13 +158,16 @@ func (p *WeChatPlugin) GetDisplay(location *url.URL) string {
 		return "Plugin not configured\n\nPlease configure the plugin with your WeChat credentials."
 	}
 
-	webhookURL := &url.URL{Path: p.basePath}
+	base := p.basePath
+	if !strings.HasSuffix(base, "/") {
+		base += "/"
+	}
+	webhookURL := &url.URL{Path: base}
 	if location != nil {
 		webhookURL.Scheme = location.Scheme
 		webhookURL.Host = location.Host
 	}
 
-	messageURL := webhookURL.ResolveReference(&url.URL{Path: "message"})
 	sendURL := webhookURL.ResolveReference(&url.URL{Path: "send"})
 	testURL := webhookURL.ResolveReference(&url.URL{Path: "test"})
 
@@ -246,26 +187,6 @@ func (p *WeChatPlugin) GetDisplay(location *url.URL) string {
 		recipientInfo = fmt.Sprintf("\n### Recipient\n- **OpenID:** %s\n", maskString(p.config.OpenID))
 	}
 
-	// 构建路由规则
-	routeInfo := ""
-	if len(p.config.Routes) > 0 {
-		routeInfo = "\n### Routes\n"
-		for _, route := range p.config.Routes {
-			matchDesc := ""
-			if len(route.Match.AppID) > 0 {
-				matchDesc += fmt.Sprintf("AppID=%v ", route.Match.AppID)
-			}
-			if route.Match.MinPriority != nil {
-				matchDesc += fmt.Sprintf("Priority>=%d ", *route.Match.MinPriority)
-			}
-			if matchDesc == "" {
-				matchDesc = "(default/catch-all)"
-			}
-			recipientNames := strings.Join(route.Recipients, ", ")
-			routeInfo += fmt.Sprintf("- **%s:** %s → [%s]\n", route.Name, matchDesc, recipientNames)
-		}
-	}
-
 	return fmt.Sprintf(`# WeChat Template Message Pusher
 
 **Status:** %s
@@ -273,22 +194,12 @@ func (p *WeChatPlugin) GetDisplay(location *url.URL) string {
 ## Configuration
 - **AppID:** %s
 - **Template ID:** %s
-%s%s
+%s
 ## Usage
 
-### Send via /message (Gotify Standard Format)
-`+"`"+`POST %s`+"`"+`
+Messages sent to Gotify will be automatically forwarded to WeChat.
 
-`+"```json"+`
-{
-  "appid": 1,
-  "title": "Message Title",
-  "message": "Message Content",
-  "priority": 5
-}
-`+"```"+`
-
-### Send via /send (Legacy)
+### Send via /send (Legacy Webhook)
 `+"`"+`POST %s`+"`"+`
 
 `+"```json"+`
@@ -301,66 +212,8 @@ func (p *WeChatPlugin) GetDisplay(location *url.URL) string {
 ### Test Connection
 Click here to test: [Send Test Message](%s)
 `, status, maskString(p.config.AppID), maskString(p.config.TemplateID),
-		recipientInfo, routeInfo,
-		messageURL.String(), sendURL.String(), testURL.String())
-}
-
-// resolveRecipients 根据 appID 和 priority 匹配路由规则，返回目标 OpenID 列表
-func (p *WeChatPlugin) resolveRecipients(appID int, priority int) []string {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-
-	// 如果没有配置路由，退回到全部接收者
-	if len(p.config.Routes) == 0 {
-		return p.getAllOpenIDs()
-	}
-
-	// 构建 name -> openid 映射
-	recipientMap := make(map[string]string)
-	for _, r := range p.config.Recipients {
-		recipientMap[r.Name] = r.OpenID
-	}
-
-	// 按顺序匹配路由规则
-	for _, route := range p.config.Routes {
-		if p.matchRoute(route, appID, priority) {
-			var openIDs []string
-			for _, name := range route.Recipients {
-				if oid, ok := recipientMap[name]; ok {
-					openIDs = append(openIDs, oid)
-				}
-			}
-			return openIDs
-		}
-	}
-
-	return nil
-}
-
-// matchRoute 检查消息是否匹配路由规则
-func (p *WeChatPlugin) matchRoute(route Route, appID int, priority int) bool {
-	// 检查 app_id 匹配
-	if len(route.Match.AppID) > 0 {
-		matched := false
-		for _, id := range route.Match.AppID {
-			if id == appID {
-				matched = true
-				break
-			}
-		}
-		if !matched {
-			return false
-		}
-	}
-
-	// 检查优先级匹配
-	if route.Match.MinPriority != nil {
-		if priority < *route.Match.MinPriority {
-			return false
-		}
-	}
-
-	return true
+		recipientInfo,
+		sendURL.String(), testURL.String())
 }
 
 // getAllOpenIDs 获取所有配置的 OpenID
@@ -400,6 +253,18 @@ func (p *WeChatPlugin) sendToMultiple(openIDs []string, title, content string) [
 	}
 
 	wg.Wait()
+
+	if len(errs) > 0 && p.msgHandler != nil {
+		errMsgs := make([]string, len(errs))
+		for i, e := range errs {
+			errMsgs[i] = e.Error()
+		}
+		p.msgHandler.SendMessage(plugin.Message{
+			Message: fmt.Sprintf("[WeChat Plugin] Failed to send \"%s\" to %d/%d recipients:\n%s",
+				title, len(errs), len(openIDs), strings.Join(errMsgs, "\n")),
+		})
+	}
+
 	return errs
 }
 
