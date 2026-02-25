@@ -42,23 +42,31 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # 使用 gomod-cap 对齐插件依赖版本与 gotify/server 完全一致，然后构建
-      - name: Align dependencies and build plugin
+      # 在宿主机(amd64)上用 Go 运行 gomod-cap 对齐依赖，避免交叉编译镜像中 exec format error
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ needs.detect-go-version.outputs.go-version }}
+
+      - name: Align dependencies with gotify/server
         run: |
           SERVER_VERSION=$(curl -sL https://api.github.com/repos/gotify/server/releases/latest | jq -r '.tag_name')
           echo "Aligning dependencies with gotify/server ${SERVER_VERSION}"
           curl -sL "https://raw.githubusercontent.com/gotify/server/${SERVER_VERSION}/go.mod" -o /tmp/gotify-server-go.mod
+          go run github.com/gotify/plugin-api/cmd/gomod-cap@latest -from /tmp/gotify-server-go.mod -to go.mod
+          go mod tidy
+
+      # 使用 gotify/build 交叉编译镜像构建插件
+      - name: Build plugin
+        run: |
           mkdir -p build
           docker run --rm \
             -v "$PWD:/proj" \
-            -v "/tmp/gotify-server-go.mod:/tmp/gotify-server-go.mod" \
             -w /proj \
             gotify/build:${{ needs.detect-go-version.outputs.go-version }}-${{ matrix.build-image-suffix }} \
-            sh -c "go run github.com/gotify/plugin-api/cmd/gomod-cap@latest -from /tmp/gotify-server-go.mod -to go.mod && \
-                   go mod tidy && \
-                   go build -a -installsuffix cgo -ldflags '-w -s' \
-                     -buildmode=plugin \
-                     -o build/gotify-wechat-plugin-linux-${{ matrix.arch }}.so ."
+            go build -a -installsuffix cgo -ldflags '-w -s' \
+              -buildmode=plugin \
+              -o build/gotify-wechat-plugin-linux-${{ matrix.arch }}.so .
 
       - name: Verify plugin
         run: file build/*.so
