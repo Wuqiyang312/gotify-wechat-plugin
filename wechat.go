@@ -53,6 +53,15 @@ type WechatAPIResponse struct {
 	Msgid   int64  `json:"msgid"`
 }
 
+// GotifyMessage gotify 标准消息格式
+type GotifyMessage struct {
+	AppID    int                    `json:"appid"`
+	Title    string                 `json:"title"`
+	Message  string                 `json:"message" binding:"required"`
+	Priority int                    `json:"priority"`
+	Extras   map[string]interface{} `json:"extras"`
+}
+
 func (p *WeChatPlugin) Enable() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -88,6 +97,60 @@ func (p *WeChatPlugin) SetStorageHandler(h plugin.StorageHandler) {
 func (p *WeChatPlugin) RegisterWebhook(basePath string, router *gin.RouterGroup) {
 	p.basePath = basePath
 
+	// POST /message - gotify 标准消息格式，支持路由
+	router.POST("/message", func(c *gin.Context) {
+		if !p.enabled {
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error": "plugin is disabled",
+			})
+			return
+		}
+
+		var msg GotifyMessage
+		if err := c.ShouldBindJSON(&msg); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": fmt.Sprintf("invalid request: %v", err),
+			})
+			return
+		}
+
+		title := msg.Title
+		if title == "" {
+			title = "Gotify Notification"
+		}
+
+		// 解析路由，找到目标 OpenID 列表
+		openIDs := p.resolveRecipients(msg.AppID, msg.Priority)
+		if len(openIDs) == 0 {
+			c.JSON(http.StatusOK, gin.H{
+				"success": true,
+				"message": "no matching recipients, message skipped",
+			})
+			return
+		}
+
+		// 发送给所有匹配的接收者
+		errors := p.sendToMultiple(openIDs, title, msg.Message)
+		if len(errors) > 0 {
+			errMsgs := make([]string, len(errors))
+			for i, e := range errors {
+				errMsgs[i] = e.Error()
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error":   fmt.Sprintf("partial failure: %d/%d failed", len(errors), len(openIDs)),
+				"details": errMsgs,
+			})
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"success":    true,
+			"message":    "sent to WeChat successfully",
+			"recipients": len(openIDs),
+		})
+	})
+
+	// POST /send - 向后兼容旧接口，发送给所有接收者
 	router.POST("/send", func(c *gin.Context) {
 		if !p.enabled {
 			c.JSON(http.StatusServiceUnavailable, gin.H{
@@ -108,9 +171,11 @@ func (p *WeChatPlugin) RegisterWebhook(basePath string, router *gin.RouterGroup)
 			return
 		}
 
-		if err := p.sendToWeChat(req.Title, req.Content); err != nil {
+		openIDs := p.getAllOpenIDs()
+		errors := p.sendToMultiple(openIDs, req.Title, req.Content)
+		if len(errors) > 0 {
 			c.JSON(http.StatusInternalServerError, gin.H{
-				"error": fmt.Sprintf("failed to send to WeChat: %v", err),
+				"error": fmt.Sprintf("failed to send to WeChat: %d/%d failed", len(errors), len(openIDs)),
 			})
 			return
 		}
@@ -121,6 +186,7 @@ func (p *WeChatPlugin) RegisterWebhook(basePath string, router *gin.RouterGroup)
 		})
 	})
 
+	// GET /test - 测试连接，发送给所有接收者
 	router.GET("/test", func(c *gin.Context) {
 		if !p.enabled {
 			c.JSON(http.StatusServiceUnavailable, gin.H{
@@ -129,17 +195,19 @@ func (p *WeChatPlugin) RegisterWebhook(basePath string, router *gin.RouterGroup)
 			return
 		}
 
-		err := p.sendToWeChat("Test Message", "This is a test message from Gotify WeChat Plugin")
-		if err != nil {
+		openIDs := p.getAllOpenIDs()
+		errors := p.sendToMultiple(openIDs, "Test Message", "This is a test message from Gotify WeChat Plugin")
+		if len(errors) > 0 {
 			c.JSON(http.StatusInternalServerError, gin.H{
-				"error": fmt.Sprintf("test failed: %v", err),
+				"error": fmt.Sprintf("test failed: %d/%d failed", len(errors), len(openIDs)),
 			})
 			return
 		}
 
 		c.JSON(http.StatusOK, gin.H{
-			"success": true,
-			"message": "test message sent successfully",
+			"success":    true,
+			"message":    "test message sent successfully",
+			"recipients": len(openIDs),
 		})
 	})
 }
@@ -157,18 +225,45 @@ func (p *WeChatPlugin) GetDisplay(location *url.URL) string {
 		webhookURL.Scheme = location.Scheme
 		webhookURL.Host = location.Host
 	}
-	webhookURL = webhookURL.ResolveReference(&url.URL{Path: "send"})
 
-	testURL := &url.URL{Path: p.basePath}
-	if location != nil {
-		testURL.Scheme = location.Scheme
-		testURL.Host = location.Host
-	}
-	testURL = testURL.ResolveReference(&url.URL{Path: "test"})
+	messageURL := webhookURL.ResolveReference(&url.URL{Path: "message"})
+	sendURL := webhookURL.ResolveReference(&url.URL{Path: "send"})
+	testURL := webhookURL.ResolveReference(&url.URL{Path: "test"})
 
 	status := "Disabled"
 	if p.enabled {
 		status = "Enabled"
+	}
+
+	// 构建接收者列表
+	recipientInfo := ""
+	if len(p.config.Recipients) > 0 {
+		recipientInfo = "\n### Recipients\n"
+		for _, r := range p.config.Recipients {
+			recipientInfo += fmt.Sprintf("- **%s:** %s\n", r.Name, maskString(r.OpenID))
+		}
+	} else if p.config.OpenID != "" {
+		recipientInfo = fmt.Sprintf("\n### Recipient\n- **OpenID:** %s\n", maskString(p.config.OpenID))
+	}
+
+	// 构建路由规则
+	routeInfo := ""
+	if len(p.config.Routes) > 0 {
+		routeInfo = "\n### Routes\n"
+		for _, route := range p.config.Routes {
+			matchDesc := ""
+			if len(route.Match.AppID) > 0 {
+				matchDesc += fmt.Sprintf("AppID=%v ", route.Match.AppID)
+			}
+			if route.Match.MinPriority != nil {
+				matchDesc += fmt.Sprintf("Priority>=%d ", *route.Match.MinPriority)
+			}
+			if matchDesc == "" {
+				matchDesc = "(default/catch-all)"
+			}
+			recipientNames := strings.Join(route.Recipients, ", ")
+			routeInfo += fmt.Sprintf("- **%s:** %s → [%s]\n", route.Name, matchDesc, recipientNames)
+		}
 	}
 
 	return fmt.Sprintf(`# WeChat Template Message Pusher
@@ -177,18 +272,25 @@ func (p *WeChatPlugin) GetDisplay(location *url.URL) string {
 
 ## Configuration
 - **AppID:** %s
-- **OpenID:** %s
 - **Template ID:** %s
-
+%s%s
 ## Usage
 
-### Send via Webhook
-Send POST request to:
-`+"`"+`
-%s
-`+"`"+`
+### Send via /message (Gotify Standard Format)
+`+"`"+`POST %s`+"`"+`
 
-**Request Body:**
+`+"```json"+`
+{
+  "appid": 1,
+  "title": "Message Title",
+  "message": "Message Content",
+  "priority": 5
+}
+`+"```"+`
+
+### Send via /send (Legacy)
+`+"`"+`POST %s`+"`"+`
+
 `+"```json"+`
 {
   "title": "Message Title",
@@ -198,15 +300,111 @@ Send POST request to:
 
 ### Test Connection
 Click here to test: [Send Test Message](%s)
-
-## Notes
-- Messages will be forwarded to WeChat using template messages
-- Make sure your WeChat service account has the template message permission
-- The template should have fields: title, content
-`, status, maskString(p.config.AppID), maskString(p.config.OpenID), maskString(p.config.TemplateID), webhookURL.String(), testURL.String())
+`, status, maskString(p.config.AppID), maskString(p.config.TemplateID),
+		recipientInfo, routeInfo,
+		messageURL.String(), sendURL.String(), testURL.String())
 }
 
-func (p *WeChatPlugin) sendToWeChat(title, content string) error {
+// resolveRecipients 根据 appID 和 priority 匹配路由规则，返回目标 OpenID 列表
+func (p *WeChatPlugin) resolveRecipients(appID int, priority int) []string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	// 如果没有配置路由，退回到全部接收者
+	if len(p.config.Routes) == 0 {
+		return p.getAllOpenIDs()
+	}
+
+	// 构建 name -> openid 映射
+	recipientMap := make(map[string]string)
+	for _, r := range p.config.Recipients {
+		recipientMap[r.Name] = r.OpenID
+	}
+
+	// 按顺序匹配路由规则
+	for _, route := range p.config.Routes {
+		if p.matchRoute(route, appID, priority) {
+			var openIDs []string
+			for _, name := range route.Recipients {
+				if oid, ok := recipientMap[name]; ok {
+					openIDs = append(openIDs, oid)
+				}
+			}
+			return openIDs
+		}
+	}
+
+	return nil
+}
+
+// matchRoute 检查消息是否匹配路由规则
+func (p *WeChatPlugin) matchRoute(route Route, appID int, priority int) bool {
+	// 检查 app_id 匹配
+	if len(route.Match.AppID) > 0 {
+		matched := false
+		for _, id := range route.Match.AppID {
+			if id == appID {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+
+	// 检查优先级匹配
+	if route.Match.MinPriority != nil {
+		if priority < *route.Match.MinPriority {
+			return false
+		}
+	}
+
+	return true
+}
+
+// getAllOpenIDs 获取所有配置的 OpenID
+func (p *WeChatPlugin) getAllOpenIDs() []string {
+	if len(p.config.Recipients) > 0 {
+		openIDs := make([]string, 0, len(p.config.Recipients))
+		for _, r := range p.config.Recipients {
+			openIDs = append(openIDs, r.OpenID)
+		}
+		return openIDs
+	}
+	// 向后兼容：单 OpenID 模式
+	if p.config.OpenID != "" {
+		return []string{p.config.OpenID}
+	}
+	return nil
+}
+
+// sendToMultiple 向多个 OpenID 发送消息，返回所有错误
+func (p *WeChatPlugin) sendToMultiple(openIDs []string, title, content string) []error {
+	var (
+		errs []error
+		mu   sync.Mutex
+		wg   sync.WaitGroup
+	)
+
+	for _, oid := range openIDs {
+		wg.Add(1)
+		go func(openID string) {
+			defer wg.Done()
+			if err := p.sendToWeChat(openID, title, content); err != nil {
+				mu.Lock()
+				errs = append(errs, fmt.Errorf("openid %s: %w", maskString(openID), err))
+				mu.Unlock()
+			}
+		}(oid)
+	}
+
+	wg.Wait()
+	return errs
+}
+
+// sendToWeChat 向指定 OpenID 发送微信模板消息
+func (p *WeChatPlugin) sendToWeChat(openID, title, content string) error {
 	if p.config == nil {
 		return fmt.Errorf("plugin not configured")
 	}
@@ -219,7 +417,7 @@ func (p *WeChatPlugin) sendToWeChat(title, content string) error {
 	apiURL := fmt.Sprintf("https://api.weixin.qq.com/cgi-bin/message/template/send?access_token=%s", token)
 
 	requestData := TemplateMessageRequest{
-		ToUser:     p.config.OpenID,
+		ToUser:     openID,
 		TemplateID: p.config.TemplateID,
 		URL:        p.config.JumpURL,
 		Data: map[string]interface{}{
@@ -264,7 +462,7 @@ func (p *WeChatPlugin) sendToWeChat(title, content string) error {
 		return fmt.Errorf("WeChat API error: code=%d, msg=%s", apiResp.Errcode, apiResp.Errmsg)
 	}
 
-	log.Printf("[WeChat Plugin] Message sent successfully, msgid: %d", apiResp.Msgid)
+	log.Printf("[WeChat Plugin] Message sent successfully to %s, msgid: %d", maskString(openID), apiResp.Msgid)
 	return nil
 }
 
