@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -24,7 +25,18 @@ type WeChatPlugin struct {
 	config     *Config
 	basePath   string
 	tokenCache *TokenCache
+	msgMgr     *MessageManager
+	stream     *StreamListener
 	mu         sync.RWMutex
+}
+
+// MessageManager 消息管理器，负责消息统计、通知和错误上报
+type MessageManager struct {
+	handler    plugin.MessageHandler
+	totalSent  atomic.Int64
+	totalFail  atomic.Int64
+	lastSentAt atomic.Value // time.Time
+	lastError  atomic.Value // string
 }
 
 type TokenCache struct {
@@ -53,6 +65,90 @@ type WechatAPIResponse struct {
 	Msgid   int64  `json:"msgid"`
 }
 
+// NewMessageManager 创建消息管理器
+func NewMessageManager(h plugin.MessageHandler) *MessageManager {
+	return &MessageManager{handler: h}
+}
+
+// NotifyStatus 发送插件状态变更通知到 Gotify
+func (m *MessageManager) NotifyStatus(userName, status string) {
+	if m == nil || m.handler == nil {
+		return
+	}
+	_ = m.handler.SendMessage(plugin.Message{
+		Title:    "微信推送插件状态变更",
+		Message:  fmt.Sprintf("用户 %s 的微信推送插件已%s", userName, status),
+		Priority: 2,
+	})
+}
+
+// NotifyDelivery 发送投递确认通知到 Gotify
+func (m *MessageManager) NotifyDelivery(title string, successCount, totalCount int) {
+	if m == nil || m.handler == nil {
+		return
+	}
+	msg := fmt.Sprintf("消息「%s」已成功推送至 %d/%d 个接收者", title, successCount, totalCount)
+	_ = m.handler.SendMessage(plugin.Message{
+		Title:    "微信推送成功",
+		Message:  msg,
+		Priority: 1,
+	})
+}
+
+// NotifyError 发送结构化错误通知到 Gotify
+func (m *MessageManager) NotifyError(title string, errs []error, totalCount int) {
+	if m == nil || m.handler == nil {
+		return
+	}
+	errMsgs := make([]string, len(errs))
+	for i, e := range errs {
+		errMsgs[i] = fmt.Sprintf("  - %s", e.Error())
+	}
+	msg := fmt.Sprintf("消息「%s」推送失败 %d/%d:\n%s",
+		title, len(errs), totalCount, strings.Join(errMsgs, "\n"))
+
+	m.lastError.Store(msg)
+
+	_ = m.handler.SendMessage(plugin.Message{
+		Title:    "微信推送失败",
+		Message:  msg,
+		Priority: 5,
+	})
+}
+
+// RecordSuccess 记录成功发送
+func (m *MessageManager) RecordSuccess(count int) {
+	if m == nil {
+		return
+	}
+	m.totalSent.Add(int64(count))
+	m.lastSentAt.Store(time.Now())
+}
+
+// RecordFailure 记录发送失败
+func (m *MessageManager) RecordFailure(count int) {
+	if m == nil {
+		return
+	}
+	m.totalFail.Add(int64(count))
+}
+
+// Stats 返回消息统计信息
+func (m *MessageManager) Stats() (sent, failed int64, lastSent time.Time, lastErr string) {
+	if m == nil {
+		return 0, 0, time.Time{}, ""
+	}
+	sent = m.totalSent.Load()
+	failed = m.totalFail.Load()
+	if v := m.lastSentAt.Load(); v != nil {
+		lastSent = v.(time.Time)
+	}
+	if v := m.lastError.Load(); v != nil {
+		lastErr = v.(string)
+	}
+	return
+}
+
 func (p *WeChatPlugin) Enable() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -64,7 +160,15 @@ func (p *WeChatPlugin) Enable() error {
 	p.enabled = true
 	p.tokenCache = &TokenCache{}
 
+	// 启动 Gotify 消息流监听
+	if p.config.ClientToken != "" && len(p.config.MessageRoutes) > 0 {
+		p.stream = NewStreamListener(p)
+		go p.stream.Start()
+		log.Printf("[WeChat Plugin] Stream listener started with %d routes", len(p.config.MessageRoutes))
+	}
+
 	log.Printf("[WeChat Plugin] Enabled for user: %s", p.userCtx.Name)
+	p.msgMgr.NotifyStatus(p.userCtx.Name, "启用")
 	return nil
 }
 
@@ -72,13 +176,21 @@ func (p *WeChatPlugin) Disable() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	// 停止 Gotify 消息流监听
+	if p.stream != nil {
+		p.stream.Stop()
+		p.stream = nil
+	}
+
 	p.enabled = false
 	log.Printf("[WeChat Plugin] Disabled for user: %s", p.userCtx.Name)
+	p.msgMgr.NotifyStatus(p.userCtx.Name, "停用")
 	return nil
 }
 
 func (p *WeChatPlugin) SetMessageHandler(h plugin.MessageHandler) {
 	p.msgHandler = h
+	p.msgMgr = NewMessageManager(h)
 }
 
 func (p *WeChatPlugin) SetStorageHandler(h plugin.StorageHandler) {
@@ -187,6 +299,30 @@ func (p *WeChatPlugin) GetDisplay(location *url.URL) string {
 		recipientInfo = fmt.Sprintf("\n### Recipient\n- **OpenID:** %s\n", maskString(p.config.OpenID))
 	}
 
+	// 获取消息统计
+	sent, failed, lastSent, lastErr := p.msgMgr.Stats()
+	lastSentStr := "N/A"
+	if !lastSent.IsZero() {
+		lastSentStr = lastSent.Format("2006-01-02 15:04:05")
+	}
+	lastErrInfo := ""
+	if lastErr != "" {
+		lastErrInfo = fmt.Sprintf("- **Last Error:** %s\n", lastErr)
+	}
+
+	// 构建 Stream 状态
+	streamInfo := ""
+	if len(p.config.MessageRoutes) > 0 {
+		streamStatus := "Disconnected"
+		if p.stream != nil && p.stream.Connected() {
+			streamStatus = "Connected"
+		}
+		streamInfo = fmt.Sprintf("\n## Message Stream\n- **Status:** %s\n- **Routes:**\n", streamStatus)
+		for _, route := range p.config.MessageRoutes {
+			streamInfo += fmt.Sprintf("  - `%s`\n", route.Path)
+		}
+	}
+
 	return fmt.Sprintf(`# WeChat Template Message Pusher
 
 **Status:** %s
@@ -195,6 +331,11 @@ func (p *WeChatPlugin) GetDisplay(location *url.URL) string {
 - **AppID:** %s
 - **Template ID:** %s
 %s
+## Statistics
+- **Total Sent:** %d
+- **Total Failed:** %d
+- **Last Sent:** %s
+%s%s
 ## Usage
 
 Messages sent to Gotify will be automatically forwarded to WeChat.
@@ -213,6 +354,8 @@ Messages sent to Gotify will be automatically forwarded to WeChat.
 Click here to test: [Send Test Message](%s)
 `, status, maskString(p.config.AppID), maskString(p.config.TemplateID),
 		recipientInfo,
+		sent, failed, lastSentStr, lastErrInfo,
+		streamInfo,
 		sendURL.String(), testURL.String())
 }
 
@@ -254,15 +397,16 @@ func (p *WeChatPlugin) sendToMultiple(openIDs []string, title, content string) [
 
 	wg.Wait()
 
-	if len(errs) > 0 && p.msgHandler != nil {
-		errMsgs := make([]string, len(errs))
-		for i, e := range errs {
-			errMsgs[i] = e.Error()
-		}
-		p.msgHandler.SendMessage(plugin.Message{
-			Message: fmt.Sprintf("[WeChat Plugin] Failed to send \"%s\" to %d/%d recipients:\n%s",
-				title, len(errs), len(openIDs), strings.Join(errMsgs, "\n")),
-		})
+	successCount := len(openIDs) - len(errs)
+
+	if len(errs) > 0 {
+		p.msgMgr.RecordFailure(len(errs))
+		p.msgMgr.NotifyError(title, errs, len(openIDs))
+	}
+
+	if successCount > 0 {
+		p.msgMgr.RecordSuccess(successCount)
+		p.msgMgr.NotifyDelivery(title, successCount, len(openIDs))
 	}
 
 	return errs

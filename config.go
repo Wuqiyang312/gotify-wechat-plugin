@@ -11,6 +11,11 @@ type Recipient struct {
 	OpenID string `yaml:"openid" json:"openid"`
 }
 
+// MessageRoute 消息路由规则
+type MessageRoute struct {
+	Path string `yaml:"path" json:"path"` // 如 "messages/1", "hi/123", "*"
+}
+
 // Config 插件配置
 type Config struct {
 	AppID      string `yaml:"appid" json:"appid"`
@@ -23,16 +28,26 @@ type Config struct {
 
 	// 多接收者模式
 	Recipients []Recipient `yaml:"recipients" json:"recipients"`
+
+	// Gotify 连接配置（自动发现优先，手动覆盖）
+	GotifyURL   string `yaml:"gotify_url" json:"gotify_url"`     // 默认空 = 自动发现 http://localhost
+	ClientToken string `yaml:"client_token" json:"client_token"` // Gotify client token
+
+	// 消息路由规则
+	MessageRoutes []MessageRoute `yaml:"message_routes" json:"message_routes"`
 }
 
 func (p *WeChatPlugin) DefaultConfig() interface{} {
 	return &Config{
-		AppID:      "",
-		AppSecret:  "",
-		OpenID:     "",
-		TemplateID: "",
-		JumpURL:    "https://push.hzz.cool",
-		Recipients: []Recipient{},
+		AppID:         "",
+		AppSecret:     "",
+		OpenID:        "",
+		TemplateID:    "",
+		JumpURL:       "https://127.0.0.1",
+		Recipients:    []Recipient{},
+		GotifyURL:     "",
+		ClientToken:   "",
+		MessageRoutes: []MessageRoute{},
 	}
 }
 
@@ -77,7 +92,19 @@ func (p *WeChatPlugin) ValidateAndSetConfig(c interface{}) error {
 	}
 
 	if strings.TrimSpace(config.JumpURL) == "" {
-		config.JumpURL = "https://push.hzz.cool"
+		config.JumpURL = "https://127.0.0.1"
+	}
+
+	// 验证消息路由规则
+	for i, route := range config.MessageRoutes {
+		if strings.TrimSpace(route.Path) == "" {
+			return fmt.Errorf("message_routes[%d]: path is required", i)
+		}
+	}
+
+	// 如果配置了消息路由，则 ClientToken 必填
+	if len(config.MessageRoutes) > 0 && strings.TrimSpace(config.ClientToken) == "" {
+		return fmt.Errorf("client_token is required when message_routes are configured")
 	}
 
 	p.mu.Lock()
